@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import math
 from torch.utils.data import DataLoader
+from typing import Union
+from torch.nn.common_types import _size_2_t
 import torch.optim as optim
 import time
 import json
@@ -341,6 +343,120 @@ class SBPLinear2D(nn.Module):
             output[drop_indices] = out_drop.detach()
 
         return output
+
+############################################ Tiny Prop #################################################
+class TinyPropParams:
+    def __init__(self, S_min: float, S_max: float, zeta: float, number_of_layers: int):
+        self.S_min = S_min
+        self.S_max = S_max
+        self.zeta = zeta
+        self.number_of_layers = number_of_layers
+
+
+class TinyPropLayer:
+    def __init__(self, layerPosition: int):
+        self.layerPosition = layerPosition
+        self.Y_max = 0
+        self.miniBatchBpr = 0
+        self.miniBatchK = 0
+        self.epochBpr = []
+        self.epochK = []
+
+    def BPR(self, params, Y):
+        return (params.S_min + Y * (params.S_max - params.S_min) / (self.Y_max)) * (params.zeta ** self.layerPosition)
+
+    def selectGradients(self, grad_output, params):
+        # assumes grad_output.shape = [batchSize, entries]
+
+        # calculate bpr (different across batches)
+        Y = grad_output.abs().sum(1)  # Y [batchSize]
+        if (torch.max(Y) > self.Y_max):  # Check if biggest Y of batch is bigger than recorded Y
+            self.Y_max = torch.max(Y).item()
+        bpr = self.BPR(params, Y)  # bpr [batchSize]
+
+        # calculate K [batchSize]
+        K = torch.round(grad_output.size(1) * bpr)  # K [batchSize]
+        K.clamp(1, grad_output.size(1))
+        self.miniBatchBpr += torch.mean(bpr).item()
+        self.miniBatchK += torch.mean(K).item()
+        K = K.to(torch.int16)
+
+        # create a sparse grad_output tensor. Since k is different across batches, the topK indices
+        # must be assembled for each batch separately.
+        idx = []  # indices of sparse entries [batch, element]
+        val = []  # corresponding values, of size element
+        for batch, k in enumerate(K):
+            _, indices = grad_output[batch].abs().topk(k)  # don't use return VALUES since they are abs!
+            t = torch.vstack((torch.zeros_like(indices) + batch, indices))
+            idx.append(t)
+            val.append(torch.index_select(grad_output[batch], -1, indices))  # select values from grad_output instead
+
+        idx = torch.hstack(idx)
+        val = torch.cat(val)
+        return idx, val
+
+
+# ========== LINEAR ==========#
+
+class SparseLinear(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, weight, tpParams: TinyPropParams, tpInfo: TinyPropLayer,
+                bias=None):  # bias is an optional argument
+        # Save inputs in context-object for later use in backwards. Alternatively, this part could be done in a setup_context() method
+        ctx.save_for_backward(input, weight, bias)  # these are differentiable
+        # non-differentiable arguments, directly stored on ctx
+        ctx.tpParams = tpParams
+        ctx.tpInfo = tpInfo
+
+        # Do the mathematical operations associated with forwards
+        return F.linear(input, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Unpack saved tensors. NEVER modify these in the backwards function!
+        input, weight, bias = ctx.saved_tensors
+        # input   [batchSize, in]
+        # output  [batchSize, out]
+        # weights [out, in]
+        # bias    [out]
+
+        # Initialize all gradients w.r.t. inputs to None
+        grad_input = grad_weight = grad_bias = None
+
+        # This is the TinyProp part:
+        indices, values = ctx.tpInfo.selectGradients(grad_output, ctx.tpParams)
+        sparse = torch.sparse_coo_tensor(indices, values, grad_output.size())
+
+        # Do the usual bp stuff but use sparse matmul on grad_input and grad_weight
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.sparse.mm(sparse, weight)  # [batchSize, in]
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.sparse.mm(sparse.t(),
+                                          input)  # Gradients are zeroed each batch, batch dimension is reduced in operation -> [out, in]
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = grad_output.sum(0)
+        return grad_input, grad_weight, None, None, grad_bias
+
+
+# Create TinyProp verion of Linear by extending it. This way it integrates seemlessly into existing code
+class TinyPropLinear(TinyPropLayer, nn.Linear):
+    def __init__(self, in_features: int, out_features: int, tinyPropParams: TinyPropParams, layer_number: int,
+                 bias: bool = True, device=None, dtype=None):
+        TinyPropLayer.__init__(self, tinyPropParams.number_of_layers - layer_number)
+        nn.Linear.__init__(self, in_features, out_features, bias, device, dtype)
+
+        # Saving variables like this will pass it by REFERENCE, so changes
+        # made in backwards are reflected in layer
+        self.tpParams = tinyPropParams
+
+    def forward(self, input):
+        # Here the custom linear function is applied
+        return SparseLinear.apply(input, self.weight, self.tpParams, self, self.bias)
+
+
+
+################################################ Tiny Prop ################################################
 
 
 class SimpleNet(nn.Module):
